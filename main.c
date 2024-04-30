@@ -1,337 +1,218 @@
 /**
  * @file main.c
- *
- * @mainpage Signal Generator Project
- *
- * @section description Description
- * This program turns the Raspberry Pi Pico (RP2040) into a programmable signal generator.
- * The code includes support to input peripherals such as a push-button or a 4x4 Keypad.
- * The output is given as 8-bits that should be fed to an 8-bit DAC, in order to obtain 
- * an analogue signal. The push-button is used to change between waveformes (sine, square, sawtooth and triangle), 
- * while 4x4 Keypad can be used to introduce the desired amplitude, frequency and offset values.
- * In this case. the program implements both INTERRUPT and POLLING methods, to handle pushbutton and Keypad inputs respectively.
- *
- * @section circuit Circuit
- * - Push-button connected to GP16
- * - Keypad Rows connected like    (r1, r2, r3, r4) to (GP18, GP19, GP20, GP21) . Could be changed from here, as long as initialization is this case does NOT required consecutive pins
- * - Keypad columns connected like (c1, c2, c3, c4) to (GP22, GP26, GP27, GP28) . Could be changed from here, as long as initialization is this case does NOT required consecutive pins
- *
- * @section libraries Libraries
- * - math.h (https://pubs.opengroup.org/onlinepubs/009695399/basedefs/math.h.html)
- *   - Useful to perform mathematical operations, necessary to build function equations.
- * - string.h (https://www.ibm.com/docs/es/i/7.5?topic=files-stringh)
- *   - Necessary to process strings such as the input introduced by the Keypad. mainly used to convert strings into float or any numeric representation.
- * - time.h (https://www.ibm.com/docs/es/i/7.5?topic=files-timeh)
- *   - Used to get the current time in order to generate signals with a real-like time variable instead of calculating/generating it
- * - stdbool.h (https://www.ibm.com/docs/es/i/7.5?topic=files-stdboolh)
- *   - Needed to support the use of logical and boolean operators.
- * - stdlib.h (https://www.ibm.com/docs/es/i/7.5?topic=files-stdlibh)
- *   - Standard C library. 
- * - stdio.h (https://www.ibm.com/docs/es/i/7.5?topic=files-stdioh)
- *   - Standard Input/Output library.
- * - hardware/gpio.h (https://www.raspberrypi.com/documentation/pico-sdk/hardware.html#hardware_gpio)
- *   - This library is mandatory to manipulate the General Purpose Input/Ouput ports available in the Raspberry Pi Pico board
- * - pico/stdlib.h (https://www.raspberrypi.com/documentation//pico-sdk/stdlib_8h_source.html)
- *   - Standard library associated to the Pico Board.
- * @section notes Notes
- * - This signal generator works implementing both polling and interrupt methodology. The first, for the keypad, the second for the pushbutton.
- * - Default values can be changed with testing purposes. 
- *
- * @section todo ToDo
- * - This code and its structure could be further optimized.
- *
- * @section author Authors
- * - Created by Santiago Giraldo Tabares & Ana María Velasco Montenegro on april, 2024
- *
- *
- * Copyright (c) No-license.
+ * 
+ * @mainpage Generador de Señales Digital con Interrupciones y Teclado Matricial
+ * 
+ * @section description Descripción
+ * Este programa convierte la Raspberry Pi Pico en un generador de señales digital programable
+ * usando interrupciones para cambiar entre diferentes formas de onda y para capturar los inputs del
+ * teclado matricial, ajustando los parámetros de amplitud, frecuencia y desplazamiento DC.
+ * 
+ * @section circuit Circuito
+ * - Botón conectado a GP16 para cambio de forma de onda.
+ * - Filas del teclado matricial conectadas a GP18, GP19, GP20, GP21
+ * - Columnas del teclado matricial conectadas a GP22, GP26, GP27, GP28
+ * 
+ * @section libraries Bibliotecas
+ * - pico/stdlib.h
+ * - hardware/gpio.h
+ * - hardware/irq.h
+ * 
+ * @section notes Notas
+ * - Este programa utiliza interrupciones para todas las entradas de usuario para mejorar la eficiencia.
+ * 
+ * @section todo Por hacer
+ * - Añadir funcionalidades adicionales y optimizar el manejo de errores.
+ * 
+ * @section author Autores
+ * - Santiago Giraldo Tabares & Ana María Velasco Montenegro, abril de 2024
+ * 
+ * @section copyright Copyright
+ * - Sin licencia, uso libre.
  */
 
-#include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
-#include <stdbool.h>
+#include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdlib.h>
-#include <time.h>
 
-#define DEBOUNCE_DELAY_US 10000 ///< Delay (uS). With debouncing purposes
-#define AMPLITUDE_DEFAULT 100.0    ///< Amplitude value by default
-#define AMPLITUDE_MIN 100.0       ///< Minimum amplitude (mV)
-#define AMPLITUDE_MAX 2500.0      ///< Maximum amplitude (mV)
-#define FREQUENCY_MIN 1           ///< Mininum frequency (Hz)
-#define FREQUENCY_MAX 12000000    ///< Maximum frequency (Hz)
-#define AMPLITUDE_MAX_DAC 255     ///< Maximum amplitude value to be converted by the 8-bit DAC (2^8 - 1)
-#define VREF 3.3                  ///< Reference voltaje for 8-bit DAC
-#define M_PI 3.14159265358979323846 ///< Value of PI
+#define DEBOUNCE_MS 200 ///< Retraso (uS). Con fines de eliminación de rebotes
+#define AMPLITUDE_MIN 100.0 ///< Amplitud mínima (mV)
+#define AMPLITUDE_MAX 2500.0 ///< Amplitud máxima (mV)
+#define FREQUENCY_MIN 1 ///< Frecuencia mínima (Hz)
+#define FREQUENCY_MAX 12000000 ///< Frecuencia máxima (Hz)
+#define DAC_MAX_VALUE 255 ///< Valor máximo de amplitud a convertir por el DAC de 8 bits (2^8 - 1)
+#define VREF 3.3 ///< Voltaje de referencia para el DAC de 8 bits
+#define M_PI 3.141592 ///< Valor de PI
+#define ROWS 4 ///< Cantidad de filas
+#define COLS 4 ///< Cantidad de columnas
+#define WAVEFORM_BUTTON_PIN 16
+#define DAC_PIN 0
 
-#define ROWS 4 ///< Amount of rows
-#define COLS 4 ///< Amount of columns
-
-char keys[ROWS][COLS] = {{'1','2','3','A'},{'4','5','6','B'},{'7','8','9','C'},{'*','0','#','D'}}; ///< 4x4 array, containing each of the characters present in the Keypad Layout. The order of the characters should match the order of the keypad itself.
-
-uint rowPins[ROWS] = {18, 19, 20, 21}; ///< Rows pinout (GPIOs) in the RP2040
-uint colPins[COLS] = {22, 26, 27, 28};   ///< Columns pinout (GPIOs) in the RP2040
-
-const uint waveformButtonPin = 16;     ///< Pushbutton GPIO.
-
-uint dacPins[8] = {0, 1, 2, 3, 4, 5, 6, 7}; ///< output GPIOs to be connected to the DAC. Ordered from LSB to MSB.
+uint rowPins[ROWS] = {18, 19, 20, 21}; ///< Disposición de pines de las filas (GPIOs) en el RP2040
+uint colPins[COLS] = {22, 26, 27, 28}; ///< Disposición de pines de las columnas (GPIOs) en el RP2040
+char keys[ROWS][COLS] = {{'1','2','3','A'},{'4','5','6','B'},{'7','8','9','C'},{'*','0','#','D'}}; ///< Matriz 4x4, que contiene cada uno de los caracteres presentes en el diseño del teclado. El orden de los caracteres debe coincidir con el orden del teclado en sí.
 
 typedef enum {
-    SINE, ///< Sinusoidal wave. Sin(2*pi*f*t). centered aroung its DC offset
-    SQUARE, ///< Square wave, also called pulsed wave, symetric (50% duty cycle) centered aroung its DC offset
-    SAWTOOTH, ///< Sawtooth wave. Rising time matches the period, while falling time goes to zero. centered aroung its DC offset
-    TRIANGULAR ///< Triangular wave. Symetric (rising time equals 50% of period, falling time equals 50% of period). Centered aroung its DC offset
-} Waveform; ///< Predefined signal waveforms.
+    SINE, ///< Onda sinusoidal. Sin(2*pi*f*t). centrada alrededor de su desplazamiento DC
+    SQUARE, ///< Onda cuadrada, también llamada onda pulsada, simétrica (ciclo de trabajo del 50%) centrada alrededor de su desplazamiento DC
+    SAWTOOTH, ///< Onda diente de sierra. El tiempo de subida coincide con el período, mientras que el tiempo de caída va a cero. centrada alrededor de su desplazamiento DC
+    TRIANGULAR ///< Onda triangular. Simétrica (tiempo de subida igual al 50% del período, tiempo de caída igual al 50% del período). Centrada alrededor de su desplazamiento DC
+} Waveform;
 
-Waveform currentWaveform = SINE; ///< Current waveform produced by the signal. In this line, set the default Signal waveform as Sinewave.
+volatile Waveform current_waveform = SINE; ///< Forma de onda actual producida por la señal. En esta línea, establece la forma de onda de señal predeterminada como onda sinusoidal.
+volatile float amplitude = 1000.0; ///< Establece la amplitud actual en el valor por DEFECTO
+volatile float frequency = 10.0; ///< Establece la frecuencia actual en el valor por DEFECTO
+volatile float dc_offset = 500.0; ///< Establece el desplazamiento DC actual en el valor por DEFECTO.
 
-float amplitude = AMPLITUDE_DEFAULT; ///< Set current amplitude to DEFAULT value
-float frequency = 10; ///< Set current frequency to  DEFAULT value
-float dcOffset = (AMPLITUDE_MIN + AMPLITUDE_MAX) / 2.0; ///< Set current DC offset to DEFAULT value.
+char paramType = 0;
+char inputBuffer[20];
+int inputIndex = 0;
 
-bool buttonState = false; ///< Set current state of the push-button as NOT-PRESSED.
-uint64_t lastButtonPressTime = 0; ///< With debouncing purposes. Record the time when a button was pressed.
+// Función para manejar las interrupciones de los GPIO
+void gpio_callback(uint gpio, uint32_t events);
 
+// Función para inicializar los GPIO
+void setup_gpio();
 
-/**
- * The variable "currentWaveform" changes to the NEXT waveform declared in the enum. Once the last (4th) waveform is reached, the next would be the 1st (SINE). Also prints the current waveform.
- */
-void changeWaveform() {
-    currentWaveform = (Waveform)((currentWaveform + 1) % 4);
-    switch (currentWaveform) {
-        case SINE:
-            printf("Forma de onda cambiada a: Seno\n");
-            break;
-        case SQUARE:
-            printf("Forma de onda cambiada a: Cuadrada\n");
-            break;
-        case SAWTOOTH:
-            printf("Forma de onda cambiada a: Diente de sierra\n");
-            break;
-        case TRIANGULAR:
-            printf("Forma de onda cambiada a: Triangular\n");
-            break;
-    }
-}
+// Función para manejar la entrada del teclado
+void handle_input(char key);
 
+// Función para generar la forma de onda
+void generate_waveform();
 
 /**
- * Callback function to handle the push-button input. Once, the button is pressed, this routine is executed. Inside of it, the program call the ChangeWaveform function.
- */
-void waveformButtonCallback(uint gpio, uint32_t events) {
-    // Registrar el tiempo actual
-    uint64_t currentTime = time_us_64();
-    
-    // Verificar si ha pasado el tiempo de debounce
-    if (currentTime - lastButtonPressTime >= DEBOUNCE_DELAY_US) {
-        // Cambiar la forma de onda cuando se detecte una interrupción en el botón
-        if (gpio == waveformButtonPin && events == GPIO_IRQ_EDGE_RISE) {
-            changeWaveform();
-        }
-        
-        // Actualizar el tiempo de la última pulsación del botón
-        lastButtonPressTime = currentTime;
-    }
-}
-
-
-/**
- * Initializes each pin from the Raspberry pi pico needed to output the signal. In thise case, initializez 8 pins according to the 8 bits needed in the DAC. As long as 
- * the pins are in sequence, these could be initialized with a for loop. Also, sets up the Push-button with its own Pull-up resistor.
- */
-void setup_gpio() {
-    for (int i = 0; i < 8; i++) {
-        gpio_init(dacPins[i]);
-        gpio_set_dir(dacPins[i], GPIO_OUT);
-    }
-    gpio_init(waveformButtonPin);
-    gpio_set_dir(waveformButtonPin, GPIO_IN);
-    gpio_pull_up(waveformButtonPin);
-    // Configurar interrupción en flanco de bajada para el botón
-    gpio_set_irq_enabled_with_callback(waveformButtonPin, GPIO_IRQ_EDGE_FALL, true, &waveformButtonCallback);
-}
-
-
-/**
- * Writes the value in the DAC. As long as we are using an 8-bit DAC, resulting value (well, its binary representation) should be written through 8 GPIOs. In this case, using only shifting and bitwise and the write on the correponding pin, from LSB to MSB.
- *
- * @param value   This represent the voltage of the signal in the current time. scaled between 0 and 255.
- *
- */
-void write_dac(uint8_t value) {
-    for (int i = 0; i < 8; i++) {
-        gpio_put(dacPins[i], (value >> i) & 1);
-    }
-}
-
-
-/**
- * The standard Arduino setup function used for setup and configuration tasks. 115200 baud-rate is desired as we are working on Raspberry Pi Pico. Also prints the initial configuration of the system.
- */
-void setup() {
-    stdio_init_all();
-    setup_gpio();
-}
-
-
-/**
- * Function to get input from the 4x4 matrix keypad. Also stablish each column as INPUT _PULLUP, and each row as OUTPUT. Checks in every ROW/COLUMN combination and if a row and a column match being LOW, the key corresponding to both column and row was pressed. 
- *  Then, save the key, debounces and wait for the key to be released.
- * @return  The key that was pressed.
- */
-char getKeypadInput() {
-    char key = '\0';
-    for (uint col = 0; col < COLS; col++) {
-        gpio_init(colPins[col]);
-        gpio_set_dir(colPins[col], GPIO_IN);
-        gpio_pull_up(colPins[col]);
-    }
-
-    for (uint row = 0; row < ROWS; row++) {
-        gpio_init(rowPins[row]);
-        gpio_set_dir(rowPins[row], GPIO_OUT);
-        gpio_put(rowPins[row], 0);
-
-        for (uint col = 0; col < COLS; col++) {
-            if (!gpio_get(colPins[col])) {
-                key = keys[row][col];
-                sleep_ms(50); // Debounce delay
-                while (!gpio_get(colPins[col])) {} // Wait for key release
-            }
-        }
-
-        gpio_put(rowPins[row], 1);
-        gpio_set_dir(rowPins[row], GPIO_IN);
-    }
-
-    return key;
-}
-
-
-/**
- * Only if the pressed key was an "A". Get input from the keypad and saves it in the amplitude variable. Converts it from string to float, then constrains it in the range of [AMPLITUDE_MIN, AMPLITUDE_MAX].
- */
-void readAmplitude() {
-    printf("Ingrese la amplitud (mV) [%.0f-%.0f]: ", AMPLITUDE_MIN, AMPLITUDE_MAX);
-    char key = '\0';
-    char amplitudeStr[16] = "";
-    size_t amplitudeIndex = 0;
-    while (key != 'D') {
-        key = getKeypadInput();
-        if (key >= '0' && key <= '9') {
-            amplitudeStr[amplitudeIndex++] = key;
-            printf("%c", key);
-        }
-        sleep_ms(200);
-    }
-    amplitudeStr[amplitudeIndex] = '\0';
-    float amplitudeValue = strtof(amplitudeStr, NULL);
-    amplitude = fminf(fmaxf(amplitudeValue, AMPLITUDE_MIN), AMPLITUDE_MAX);
-    printf(" mV\n");
-    printf("Amplitud establecida en: %.1f mV\n", amplitude);
-}
-
-
-/**
- * Only if the pressed key was an "B". Get input from the keypad and saves it in the frequency variable. Converts it from string to float, then constrains it in the range of [FREQUENCY_MIN, FREQUENCY_MAX].
- */
-void readFrequency() {
-    printf("Ingrese la frecuencia (Hz) [%d-%d]: ", FREQUENCY_MIN, FREQUENCY_MAX);
-    char key = '\0';
-    char frequencyStr[16] = "";
-    size_t frequencyIndex = 0;
-    while (key != 'D') {
-        key = getKeypadInput();
-        if (key >= '0' && key <= '9') {
-            frequencyStr[frequencyIndex++] = key;
-            printf("%c", key);
-        }
-        sleep_ms(200);
-    }
-    frequencyStr[frequencyIndex] = '\0';
-    float frequencyValue = strtof(frequencyStr, NULL);
-    frequency = fminf(fmaxf(frequencyValue, FREQUENCY_MIN), FREQUENCY_MAX);
-    printf(" Hz\n");
-    printf("Frecuencia establecida en: %.0f Hz\n", frequency);
-}
-
-
-/**
- * Only if the pressed key was an "C". Get input from the keypad and saves it in the dcOffset variable. Converts it from string to float, then constrains it in the range of [AMPLITUDE_MIN / 2.0, AMPLITUDE_MAX / 2.0].
- */
-void readDCOffset() {
-    printf("Ingrese el desplazamiento DC (mV) [%.1f-%.1f]: ", AMPLITUDE_MIN / 2.0, AMPLITUDE_MAX / 2.0);
-    char key = '\0';
-    char offsetStr[16] = "";
-    size_t offsetIndex = 0;
-    while (key != 'D') {
-        key = getKeypadInput();
-        if (key >= '0' && key <= '9') {
-            offsetStr[offsetIndex++] = key;
-            printf("%c", key);
-        }
-        sleep_ms(200);
-    }
-    offsetStr[offsetIndex] = '\0';
-    float offsetValue = strtof(offsetStr, NULL);
-    dcOffset = fminf(fmaxf(offsetValue, AMPLITUDE_MIN / 2.0), AMPLITUDE_MAX / 2.0);
-    printf(" mV\n");
-    printf("Desplazamiento DC establecido en: %.1f mV\n", dcOffset);
-}
-
-
-/**
- * Main loop function of the program. Executes the signal generation and polling functions corresponding to keypad handling, in cyclic way. 
+ * Función principal del programa. Trabajando solo con llamadas de subrutina de interrupción.
  */
 int main() {
-    setup();
+    stdio_init_all();
+    setup_gpio();
+    printf("Signal Generator Started.\n");
+
     while (true) {
-    char key = getKeypadInput();
-            if (key == 'A') {
-                readAmplitude();
-            } else if (key == 'B') {
-                readFrequency();
-            } else if (key == 'C') {
-                readDCOffset();
-            }
-
-            if (!gpio_get(waveformButtonPin)) {
-                sleep_ms(50); // Debounce delay
-                if (!gpio_get(waveformButtonPin)) { // Check again after debounce delay
-                    changeWaveform();
-                    sleep_ms(500); // Debounce delay
-                }
-            }
-
-            for (size_t i = 0; i < 256; i++) {
-                uint64_t current_time = time_us_64();
-                float value;
-                switch (currentWaveform) {
-                    case SINE:
-                        value = (amplitude * 0.001 * (sinf(2.0f * M_PI * frequency * current_time / 1000000.0f))) + (dcOffset * 0.001);
-                        break;
-                    case SQUARE:
-                        if (sinf(2.0f * M_PI * frequency * current_time / 1000000.0f) >= 0.0f) {
-                            value = (amplitude * 0.001) + (dcOffset * 0.001); // Positive half of the square wave
-                        } else {
-                            value = -(amplitude * 0.001) + (dcOffset * 0.001); // Negative half of the square wave
-                        }
-                        break;
-                    case SAWTOOTH:
-                        value = (fmodf(frequency * current_time / 1000000.0f, 1.0f) * 2.0f - 1.0f) * (amplitude * 0.001) + (dcOffset * 0.001);
-                        break;
-                    case TRIANGULAR:
-                        value = (2.0f * fabsf(2.0f * (frequency * current_time / 1000000.0f - floor(frequency * current_time / 1000000.0f + 0.5f))) - 1.0f) * (amplitude * 0.001 / 2.0) + (dcOffset * 0.001);
-                        break;
-                }
-                float scaled_value = (value + 1.0f) * 127.5f;
-                uint8_t dac_value = (uint8_t)fminf(fmaxf(scaled_value, 0.0f), 255.0f);
-                write_dac(dac_value);
-
-                sleep_us(1); // Sleep for a short duration for better accuracy
-            }
+        generate_waveform();
     }
+
     return 0;
+}
+
+/**
+ * Inicializa cada pin de la Raspberry Pi Pico necesario para producir la señal. En este caso, inicializa 8 pines de acuerdo con los 8 bits necesarios en el DAC. Mientras
+ * los pines estén en secuencia, estos podrían inicializarse con un bucle for. Además, configura el botón de pulsación con su propio resistor de pull-up.
+ */
+void setup_gpio() {
+    // Configuración para el DAC y el botón de forma de onda
+    gpio_init(DAC_PIN);
+    gpio_set_dir(DAC_PIN, GPIO_OUT);
+
+    gpio_init(WAVEFORM_BUTTON_PIN);
+    gpio_set_dir(WAVEFORM_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(WAVEFORM_BUTTON_PIN);
+    gpio_set_irq_enabled_with_callback(WAVEFORM_BUTTON_PIN, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+
+    // Configuración para el teclado
+    for (int i = 0; i < ROWS; i++) {
+        gpio_init(rowPins[i]);
+        gpio_set_dir(rowPins[i], GPIO_OUT);
+        gpio_put(rowPins[i], 1);
+    }
+
+    for (int i = 0; i < COLS; i++) {
+        gpio_init(colPins[i]);
+        gpio_set_dir(colPins[i], GPIO_IN);
+        gpio_pull_up(colPins[i]);
+        gpio_set_irq_enabled_with_callback(colPins[i], GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+    }
+}
+
+/**
+ * Esta función genera una forma de onda basada en la ecuación correspondiente a la forma de onda deseada.
+ */
+void generate_waveform() {
+    static uint64_t last_time = 0;
+    uint64_t current_time = time_us_64();
+    float value = 0;
+
+    // Calcular el paso de tiempo
+    float time_step = (current_time - last_time) / 1000000.0f;
+    last_time = current_time;
+
+    switch (current_waveform) {
+        case SINE:
+            value = amplitude * (sinf(2 * M_PI * frequency * time_step) / 2 + 0.5) + dc_offset;
+            break;
+        case SQUARE:
+            value = amplitude * (sinf(2 * M_PI * frequency * time_step) > 0 ? 1 : -1) / 2 + 0.5 + dc_offset;
+            break;
+        case SAWTOOTH:
+            value = amplitude * (2 * fmod(frequency * time_step, 1) - 1) / 2 + 0.5 + dc_offset;
+            break;
+        case TRIANGULAR:
+            value = amplitude * (1.0 - fabs(fmod(frequency * time_step * 4, 4) - 2)) + dc_offset;
+            break;
+    }
+
+    // Convertir a valor DAC
+    uint dac_value = (uint)((value / VREF) * DAC_MAX_VALUE);
+    gpio_put(DAC_PIN, dac_value);  // Suponiendo que DAC_PIN está conectado a un DAC de escalera R2R simple o similar
+}
+
+/**
+ * Función para manejar las interrupciones de los GPIO. Debe manejar tanto el botón como el teclado.
+ */
+void gpio_callback(uint gpio, uint32_t events) {
+    static uint64_t last_interrupt_time = 0;
+    uint64_t current_time = to_ms_since_boot(get_absolute_time());
+
+    if (current_time - last_interrupt_time > DEBOUNCE_MS) {
+        last_interrupt_time = current_time;
+
+        if (gpio == WAVEFORM_BUTTON_PIN) {
+            current_waveform = (Waveform)((current_waveform + 1) % 4);
+            printf("Forma de onda cambiada a %d\n", current_waveform);
+        } else {
+            for (int row = 0; row < ROWS; ++row) {
+                gpio_put(rowPins[row], 0);  // Activar la fila
+                for (int col = 0; col < COLS; ++col) {
+                    if (!gpio_get(colPins[col])) {
+                        char key = keys[row][col];
+                        printf("Tecla presionada: %c\n", key);
+                        handle_input(key);
+                    }
+                }
+                gpio_put(rowPins[row], 1);  // Desactivar la fila
+            }
+        }
+    }
+}
+
+/**
+ * Obtener la entrada y convertirla de cadena a valor flotante, para amplitud, frecuencia y desplazamiento.
+ */
+void handle_input(char key) {
+    if (key == 'D') {
+        if (paramType == 'A') {
+            amplitude = strtof(inputBuffer, NULL);
+            printf("Amplitud establecida en: %.2f mV\n", amplitude);
+        } else if (paramType == 'B') {
+            frequency = strtof(inputBuffer,NULL);
+            printf("Frecuencia establecida en: %.2f Hz\n", frequency);
+        } else if (paramType == 'C') {
+            dc_offset = strtof(inputBuffer,NULL);
+            printf("Desplazamiento DC establecido en: %.2f mV\n", dc_offset);
+        }
+        inputIndex = 0;
+        memset(inputBuffer, 0, sizeof(inputBuffer));
+    } else {
+        if (key == 'A' || key == 'B' || key == 'C') {
+            paramType = key;
+        } else if (isdigit(key)) {
+            if (inputIndex < sizeof(inputBuffer) - 1) {
+                inputBuffer[inputIndex++] = key;
+            }
+        }
+    }
 }
